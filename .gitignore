@@ -1,0 +1,15 @@
+.env
+.env.local
+.env.swp
+env.local
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+/Godeps/
+editor
+redis-sentinel-proxy
