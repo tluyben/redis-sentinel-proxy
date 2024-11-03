@@ -8,6 +8,7 @@ A lightweight proxy that sits between your Redis clients and Redis Sentinel setu
 - 🔐 Password authentication support
 - 🔌 Standard Redis protocol compatibility
 - 🚪 Custom port configuration
+- 🌐 Configurable bind address
 - 📝 Environment variable support
 
 ## 🏗️ Installation
@@ -43,14 +44,24 @@ export SENTINEL_PASSWORD=your_sentinel_password_here
 
 ## 🚀 Usage
 
+Basic usage with default settings (binds to 0.0.0.0):
 ```bash
 ./redis-sentinel-proxy server1,server2,server3
+```
+
+To bind to a specific IP address:
+```bash
+./redis-sentinel-proxy -bind 127.0.0.1 server1,server2,server3
 ```
 
 For example:
 
 ```bash
+# Bind to all interfaces (default)
 ./redis-sentinel-proxy redis-sentinel-1.example.com,redis-sentinel-2.example.com,redis-sentinel-3.example.com
+
+# Bind to localhost only
+./redis-sentinel-proxy -bind 127.0.0.1 redis-sentinel-1.example.com,redis-sentinel-2.example.com,redis-sentinel-3.example.com
 ```
 
 ## 📌 Port Configuration
@@ -90,6 +101,7 @@ The proxy:
 - Ensure your Redis Sentinel setup is properly configured with authentication
 - The proxy needs to be able to reach all sentinel servers
 - Client applications connect to the proxy as if it were a regular Redis instance
+- By default, the proxy binds to all interfaces (0.0.0.0). Use the -bind flag to restrict to specific interfaces
 
 ## 🐛 Troubleshooting
 
@@ -99,6 +111,7 @@ If you see connection errors:
 2. Check if `SENTINEL_PASSWORD` is set correctly
 3. Ensure sentinel servers are reachable
 4. Check firewall rules for ports 26379 and 6380
+5. Verify the bind address is accessible from your client
 
 ## 🤝 Contributing
 

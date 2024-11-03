@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -184,11 +185,15 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		log.Fatalf("Usage: %s server1,server2,server3", os.Args[0])
+	bindAddr := flag.String("bind", "0.0.0.0", "IP address to bind to")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) != 1 {
+		log.Fatalf("Usage: %s [-bind ip_address] server1,server2,server3", os.Args[0])
 	}
 
-	servers := strings.Split(os.Args[1], ",")
+	servers := strings.Split(args[0], ",")
 	if len(servers) == 0 {
 		log.Fatal("No sentinel servers provided")
 	}
@@ -208,6 +213,6 @@ func main() {
 		password:      password,
 	}
 
-	listenAddr := fmt.Sprintf(":%d", PROXY_PORT)
+	listenAddr := fmt.Sprintf("%s:%d", *bindAddr, PROXY_PORT)
 	log.Fatal(proxy.Start(listenAddr))
 }
