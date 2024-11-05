@@ -36,6 +36,7 @@ type RedisSentinelProxy struct {
 	connectionHistory  []string // Track connection history
 	connectionHistoryMu sync.Mutex
 	maxConnections     int64    // Maximum allowed connections
+	verbose           bool     // Verbose logging flag
 }
 
 func (p *RedisSentinelProxy) incrementConnections(clientAddr string) bool {
@@ -51,10 +52,11 @@ func (p *RedisSentinelProxy) incrementConnections(clientAddr string) bool {
 	p.connectionHistory = append(p.connectionHistory, fmt.Sprintf("%s - OPEN - Total: %d", clientAddr, newCount))
 	p.connectionHistoryMu.Unlock()
 	
-	log.Printf("New connection from %s (Total active: %d)", clientAddr, newCount)
+	if p.verbose {
+		log.Printf("New connection from %s (Total active: %d)", clientAddr, newCount)
+	}
 	return true
 }
-
 
 func (p *RedisSentinelProxy) decrementConnections(clientAddr string) {
 	count := atomic.AddInt64(&p.activeConnections, -1)
@@ -67,7 +69,9 @@ func (p *RedisSentinelProxy) decrementConnections(clientAddr string) {
 	}
 	p.connectionHistoryMu.Unlock()
 	
-	log.Printf("Closed connection from %s (Total active: %d)", clientAddr, count)
+	if p.verbose {
+		log.Printf("Closed connection from %s (Total active: %d)", clientAddr, count)
+	}
 }
 
 func initSentry() {
@@ -97,22 +101,6 @@ func loadEnv() string {
 
 	return password
 }
-
-// func (p *RedisSentinelProxy) handleConnection(clientConn net.Conn, masterAddr string) {
-// 	defer clientConn.Close()
-
-// 	// Connect to master
-// 	masterConn, err := net.Dial("tcp", masterAddr)
-// 	if err != nil {
-// 		log.Printf("Error connecting to master: %v", err)
-// 		return
-// 	}
-// 	defer masterConn.Close()
-
-// 	// Create bidirectional pipe
-// 	go io.Copy(masterConn, clientConn)
-// 	io.Copy(clientConn, masterConn)
-// }
 
 func (p *RedisSentinelProxy) reportSentinelError(err error) {
 	if os.Getenv("SENTRY_DSN") == "" {
@@ -148,6 +136,7 @@ func (p *RedisSentinelProxy) clearErrors() {
 	p.sentinelErrorSent = false
 	p.masterErrorSent = false
 }
+
 func readCommand(reader *bufio.Reader) (string, []string, error) {
 	// Read the first line
 	line, err := reader.ReadString('\n')
@@ -255,7 +244,6 @@ func max(a, b int) int {
 	return b
 }
 
-
 func (p *RedisSentinelProxy) Start(listenAddr string) error {
 	// Initialize sentinel
 	sntnl := &sentinel.Sentinel{
@@ -294,8 +282,10 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 		defer ticker.Stop()
 		
 		for range ticker.C {
-			current := atomic.LoadInt64(&p.activeConnections)
-			log.Printf("Connection status - Active connections: %d", current)
+			if p.verbose {
+				current := atomic.LoadInt64(&p.activeConnections)
+				log.Printf("Connection status - Active connections: %d", current)
+			}
 		}
 	}()
 
@@ -343,12 +333,13 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 func main() {
 	bindAddr := flag.String("bind", "0.0.0.0", "IP address to bind to")
 	maxConns := flag.Int64("max-connections", 1000, "Maximum number of concurrent connections")
+	verbose := flag.Bool("verbose", false, "Enable verbose connection logging")
 
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) != 1 {
-		log.Fatalf("Usage: %s [-bind ip_address] server1,server2,server3", os.Args[0])
+		log.Fatalf("Usage: %s [-bind ip_address] [-max-connections n] [-verbose] server1,server2,server3", os.Args[0])
 	}
 
 	servers := strings.Split(args[0], ",")
@@ -366,11 +357,12 @@ func main() {
 	initSentry() // Initialize Sentry if DSN is available
 
 	proxy := &RedisSentinelProxy{
-		sentinelAddrs:   sentinelAddrs,
-		masterName:      "mymaster",
-		password:        password,
-		maxConnections:  *maxConns,
+		sentinelAddrs:     sentinelAddrs,
+		masterName:        "mymaster",
+		password:          password,
+		maxConnections:    *maxConns,
 		connectionHistory: make([]string, 0, 1000),
+		verbose:           *verbose,
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", *bindAddr, PROXY_PORT)
