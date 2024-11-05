@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FZambia/sentinel"
@@ -26,11 +27,47 @@ const (
 type RedisSentinelProxy struct {
 	sentinelAddrs      []string
 	masterName         string
-	password          string
-	currentMaster     string
-	mu                sync.RWMutex
-	sentinelErrorSent bool
-	masterErrorSent   bool
+	password           string
+	currentMaster      string
+	mu                 sync.RWMutex
+	sentinelErrorSent  bool
+	masterErrorSent    bool
+	activeConnections  int64    // Track number of active connections
+	connectionHistory  []string // Track connection history
+	connectionHistoryMu sync.Mutex
+	maxConnections     int64    // Maximum allowed connections
+}
+
+func (p *RedisSentinelProxy) incrementConnections(clientAddr string) bool {
+	newCount := atomic.AddInt64(&p.activeConnections, 1)
+	
+	// If we've exceeded max connections, decrement and return false
+	if p.maxConnections > 0 && newCount > p.maxConnections {
+		atomic.AddInt64(&p.activeConnections, -1)
+		return false
+	}
+	
+	p.connectionHistoryMu.Lock()
+	p.connectionHistory = append(p.connectionHistory, fmt.Sprintf("%s - OPEN - Total: %d", clientAddr, newCount))
+	p.connectionHistoryMu.Unlock()
+	
+	log.Printf("New connection from %s (Total active: %d)", clientAddr, newCount)
+	return true
+}
+
+
+func (p *RedisSentinelProxy) decrementConnections(clientAddr string) {
+	count := atomic.AddInt64(&p.activeConnections, -1)
+	
+	p.connectionHistoryMu.Lock()
+	p.connectionHistory = append(p.connectionHistory, fmt.Sprintf("%s - CLOSE - Total: %d", clientAddr, count))
+	// Keep only last 1000 connection events
+	if len(p.connectionHistory) > 1000 {
+		p.connectionHistory = p.connectionHistory[len(p.connectionHistory)-1000:]
+	}
+	p.connectionHistoryMu.Unlock()
+	
+	log.Printf("Closed connection from %s (Total active: %d)", clientAddr, count)
 }
 
 func initSentry() {
@@ -156,9 +193,21 @@ func readCommand(reader *bufio.Reader) (string, []string, error) {
 }
 
 func (p *RedisSentinelProxy) handleConnection(clientConn net.Conn, masterAddr string) {
-	defer clientConn.Close()
+	clientAddr := clientConn.RemoteAddr().String()
+	
+	// Check if we can accept new connection
+	if !p.incrementConnections(clientAddr) {
+		log.Printf("Rejected connection from %s: max connections reached", clientAddr)
+		clientConn.Close()
+		return
+	}
+	
+	defer func() {
+		clientConn.Close()
+		p.decrementConnections(clientAddr)
+	}()
 
-	// Create connection to master
+	// Connect to master
 	masterConn, err := net.Dial("tcp", masterAddr)
 	if err != nil {
 		log.Printf("Error connecting to master: %v", err)
@@ -166,10 +215,46 @@ func (p *RedisSentinelProxy) handleConnection(clientConn net.Conn, masterAddr st
 	}
 	defer masterConn.Close()
 
-	// Create bidirectional pipe
-	go io.Copy(masterConn, clientConn)
-	io.Copy(clientConn, masterConn)
+	// Create wait group to ensure both copies complete
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Copy from client to master
+	go func() {
+		defer wg.Done()
+		io.Copy(masterConn, clientConn)
+		masterConn.(*net.TCPConn).CloseWrite()
+	}()
+
+	// Copy from master to client
+	go func() {
+		defer wg.Done()
+		io.Copy(clientConn, masterConn)
+		clientConn.(*net.TCPConn).CloseWrite()
+	}()
+
+	// Wait for both copies to complete
+	wg.Wait()
 }
+
+func (p *RedisSentinelProxy) getConnectionStats() string {
+	p.connectionHistoryMu.Lock()
+	defer p.connectionHistoryMu.Unlock()
+	
+	current := atomic.LoadInt64(&p.activeConnections)
+	history := strings.Join(p.connectionHistory[max(0, len(p.connectionHistory)-10):], "\n")
+	
+	return fmt.Sprintf("Current connections: %d\nRecent connection history:\n%s", 
+		current, history)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 
 func (p *RedisSentinelProxy) Start(listenAddr string) error {
 	// Initialize sentinel
@@ -202,6 +287,17 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 		p.reportMasterError(err)
 		return fmt.Errorf("initial master lookup failed: %v", err)
 	}
+
+	// Add periodic connection logging
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			current := atomic.LoadInt64(&p.activeConnections)
+			log.Printf("Connection status - Active connections: %d", current)
+		}
+	}()
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -246,6 +342,8 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 
 func main() {
 	bindAddr := flag.String("bind", "0.0.0.0", "IP address to bind to")
+	maxConns := flag.Int64("max-connections", 1000, "Maximum number of concurrent connections")
+
 	flag.Parse()
 
 	args := flag.Args()
@@ -268,9 +366,11 @@ func main() {
 	initSentry() // Initialize Sentry if DSN is available
 
 	proxy := &RedisSentinelProxy{
-		sentinelAddrs: sentinelAddrs,
-		masterName:    "mymaster",
-		password:      password,
+		sentinelAddrs:   sentinelAddrs,
+		masterName:      "mymaster",
+		password:        password,
+		maxConnections:  *maxConns,
+		connectionHistory: make([]string, 0, 1000),
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", *bindAddr, PROXY_PORT)
