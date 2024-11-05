@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -110,82 +111,64 @@ func (p *RedisSentinelProxy) clearErrors() {
 	p.sentinelErrorSent = false
 	p.masterErrorSent = false
 }
+func readCommand(reader *bufio.Reader) (string, []string, error) {
+	// Read the first line
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", nil, err
+	}
+
+	line = strings.TrimSpace(line)
+
+	// Simple command format
+	if !strings.HasPrefix(line, "*") {
+		return strings.ToLower(line), nil, nil
+	}
+
+	// RESP array format
+	count := 0
+	_, err = fmt.Sscanf(line, "*%d", &count)
+	if err != nil {
+		return "", nil, err
+	}
+
+	var args []string
+	for i := 0; i < count; i++ {
+		// Read the $ line
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return "", nil, err
+		}
+
+		// Read the actual argument
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return "", nil, err
+		}
+		args = append(args, strings.TrimSpace(line))
+	}
+
+	if len(args) == 0 {
+		return "", nil, fmt.Errorf("empty command")
+	}
+
+	return strings.ToLower(args[0]), args[1:], nil
+}
 
 func (p *RedisSentinelProxy) handleConnection(clientConn net.Conn, masterAddr string) {
 	defer clientConn.Close()
 
-	// Connect to master
-	masterConn, err := net.DialTimeout("tcp", masterAddr, 5*time.Second)
+	// Create connection to master
+	masterConn, err := net.Dial("tcp", masterAddr)
 	if err != nil {
 		log.Printf("Error connecting to master: %v", err)
 		return
 	}
 	defer masterConn.Close()
 
-	// Use WaitGroup to ensure both goroutines complete
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Channel to signal connection closure
-	done := make(chan struct{})
-	defer close(done)
-
-	// Client -> Master
-	go func() {
-		defer wg.Done()
-		buffer := make([]byte, 4096)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				n, err := clientConn.Read(buffer)
-				if err != nil {
-					if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("Error reading from client: %v", err)
-					}
-					return
-				}
-
-				_, err = masterConn.Write(buffer[:n])
-				if err != nil {
-					log.Printf("Error writing to master: %v", err)
-					return
-				}
-			}
-		}
-	}()
-
-	// Master -> Client
-	go func() {
-		defer wg.Done()
-		buffer := make([]byte, 4096)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				masterConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				n, err := masterConn.Read(buffer)
-				if err != nil {
-					if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("Error reading from master: %v", err)
-					}
-					return
-				}
-
-				_, err = clientConn.Write(buffer[:n])
-				if err != nil {
-					log.Printf("Error writing to client: %v", err)
-					return
-				}
-			}
-		}
-	}()
-
-	// Wait for both goroutines to complete
-	wg.Wait()
+	// Create bidirectional pipe
+	go io.Copy(masterConn, clientConn)
+	io.Copy(clientConn, masterConn)
 }
 
 func (p *RedisSentinelProxy) Start(listenAddr string) error {
@@ -194,10 +177,7 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 		Addrs:      p.sentinelAddrs,
 		MasterName: p.masterName,
 		Dial: func(addr string) (redis.Conn, error) {
-			c, err := redis.Dial("tcp", addr,
-				redis.DialReadTimeout(5*time.Second),
-				redis.DialWriteTimeout(5*time.Second),
-				redis.DialConnectTimeout(5*time.Second))
+			c, err := redis.Dial("tcp", addr)
 			if err != nil {
 				p.reportSentinelError(err)
 				return nil, err
@@ -223,59 +203,44 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 		return fmt.Errorf("initial master lookup failed: %v", err)
 	}
 
-	p.mu.Lock()
-	p.currentMaster = masterAddr
-	p.mu.Unlock()
-
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
 
 	log.Printf("Proxy listening on %s", listenAddr)
 	log.Printf("Initial master: %s", masterAddr)
 
-	// Monitor master changes
+	// Update master in background
 	go func() {
 		for {
-			time.Sleep(time.Second)
 			newMasterAddr, err := sntnl.MasterAddr()
 			if err != nil {
 				p.reportMasterError(err)
 				log.Printf("Error getting master address: %v", err)
-				continue
-			}
-
-			p.mu.Lock()
-			if newMasterAddr != p.currentMaster {
-				log.Printf("Master changed from %s to %s", p.currentMaster, newMasterAddr)
-				p.currentMaster = newMasterAddr
-			}
-			p.mu.Unlock()
-
-			p.clearErrors()
-		}
-	}()
-
-	// Accept connections
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				log.Printf("Temporary error accepting connection: %v", err)
 				time.Sleep(time.Second)
 				continue
 			}
-			return err
-		}
 
-		go func(c net.Conn) {
-			p.mu.RLock()
-			currentMaster := p.currentMaster
-			p.mu.RUnlock()
-			p.handleConnection(c, currentMaster)
-		}(conn)
+			p.clearErrors()
+
+			if newMasterAddr != masterAddr {
+				log.Printf("Master changed from %s to %s", masterAddr, newMasterAddr)
+				masterAddr = newMasterAddr
+			}
+
+			time.Sleep(time.Second)
+		}
+	}()
+
+	// Accept and handle connections
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Error accepting connection: %v", err)
+			continue
+		}
+		go p.handleConnection(conn, masterAddr)
 	}
 }
 
