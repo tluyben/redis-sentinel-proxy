@@ -332,6 +332,7 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 
 func main() {
 	bindAddr := flag.String("bind", "0.0.0.0", "IP address to bind to")
+	masterName := flag.String("service-name", "mymaster", "Service name")
 	maxConns := flag.Int64("max-connections", 1000, "Maximum number of concurrent connections")
 	verbose := flag.Bool("verbose", false, "Enable verbose connection logging")
 
@@ -358,7 +359,7 @@ func main() {
 
 	proxy := &RedisSentinelProxy{
 		sentinelAddrs:     sentinelAddrs,
-		masterName:        "mymaster",
+		masterName:        *masterName,
 		password:          password,
 		maxConnections:    *maxConns,
 		connectionHistory: make([]string, 0, 1000),
