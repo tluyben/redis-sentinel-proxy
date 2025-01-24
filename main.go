@@ -111,7 +111,7 @@ func (p *RedisSentinelProxy) reportSentinelError(err error) {
 	defer p.mu.Unlock()
 
 	if !p.sentinelErrorSent {
-		sentry.CaptureException(fmt.Errorf("cannot connect to sentinel: %v", err))
+		sentry.CaptureException(fmt.Errorf("failed to connect to sentinel (master name: %s, sentinels: %v): %v", p.masterName, p.sentinelAddrs, err))
 		p.sentinelErrorSent = true
 	}
 }
@@ -125,7 +125,7 @@ func (p *RedisSentinelProxy) reportMasterError(err error) {
 	defer p.mu.Unlock()
 
 	if !p.masterErrorSent {
-		sentry.CaptureException(fmt.Errorf("cannot get master: %v", err))
+		sentry.CaptureException(fmt.Errorf("failed to get master address for '%s' using sentinels %v: %v", p.masterName, p.sentinelAddrs, err))
 		p.masterErrorSent = true
 	}
 }
@@ -199,7 +199,9 @@ func (p *RedisSentinelProxy) handleConnection(clientConn net.Conn, masterAddr st
 	// Connect to master
 	masterConn, err := net.Dial("tcp", masterAddr)
 	if err != nil {
-		log.Printf("Error connecting to master: %v", err)
+		wrappedErr := fmt.Errorf("failed to connect to master at %s from client %s (master name: %s): %w", masterAddr, clientAddr, p.masterName, err)
+		log.Printf("%v", wrappedErr)
+		p.reportMasterError(wrappedErr)
 		return
 	}
 	defer masterConn.Close()
@@ -252,15 +254,19 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 		Dial: func(addr string) (redis.Conn, error) {
 			c, err := redis.Dial("tcp", addr)
 			if err != nil {
-				p.reportSentinelError(err)
-				return nil, err
+				wrappedErr := fmt.Errorf("failed to connect to sentinel at %s (master name: %s, sentinels: %v): %w", addr, p.masterName, p.sentinelAddrs, err)
+				log.Printf("%v", wrappedErr)
+				p.reportSentinelError(wrappedErr)
+				return nil, wrappedErr
 			}
 
 			if p.password != "" {
 				if _, err := c.Do("AUTH", p.password); err != nil {
 					c.Close()
-					p.reportSentinelError(err)
-					return nil, err
+					wrappedErr := fmt.Errorf("authentication failed for sentinel at %s (master name: %s, sentinels: %v): %w", addr, p.masterName, p.sentinelAddrs, err)
+					log.Printf("%v", wrappedErr)
+					p.reportSentinelError(wrappedErr)
+					return nil, wrappedErr
 				}
 			}
 
@@ -272,8 +278,9 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 	// Get initial master
 	masterAddr, err := sntnl.MasterAddr()
 	if err != nil {
-		p.reportMasterError(err)
-		return fmt.Errorf("initial master lookup failed: %v", err)
+		wrappedErr := fmt.Errorf("initial master lookup failed for master '%s' using sentinels %v: %w", p.masterName, p.sentinelAddrs, err)
+		p.reportMasterError(wrappedErr)
+		return wrappedErr
 	}
 
 	// Add periodic connection logging
@@ -291,7 +298,7 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to start proxy listener on %s: %w", listenAddr, err)
 	}
 
 	log.Printf("Proxy listening on %s", listenAddr)
@@ -302,8 +309,9 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 		for {
 			newMasterAddr, err := sntnl.MasterAddr()
 			if err != nil {
-				p.reportMasterError(err)
-				log.Printf("Error getting master address: %v", err)
+				wrappedErr := fmt.Errorf("failed to get master address for '%s' using sentinels %v: %w", p.masterName, p.sentinelAddrs, err)
+				p.reportMasterError(wrappedErr)
+				log.Printf("%v", wrappedErr)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -323,7 +331,7 @@ func (p *RedisSentinelProxy) Start(listenAddr string) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection: %v", err)
+			log.Printf("Error accepting connection on %s: %v", listenAddr, err)
 			continue
 		}
 		go p.handleConnection(conn, masterAddr)
@@ -367,5 +375,15 @@ func main() {
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", *bindAddr, PROXY_PORT)
+	
+	// Log startup configuration (excluding sensitive data)
+	log.Printf("Starting Redis Sentinel Proxy with configuration:")
+	log.Printf("- Bind Address: %s", listenAddr)
+	log.Printf("- Master Name: %s", *masterName)
+	log.Printf("- Sentinel Servers: %v", sentinelAddrs)
+	log.Printf("- Max Connections: %d", *maxConns)
+	log.Printf("- Verbose Logging: %v", *verbose)
+	log.Printf("- Sentry Enabled: %v", os.Getenv("SENTRY_DSN") != "")
+
 	log.Fatal(proxy.Start(listenAddr))
 }
